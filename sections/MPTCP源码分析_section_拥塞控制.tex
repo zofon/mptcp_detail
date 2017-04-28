@@ -1,0 +1,47 @@
+\section{拥塞控制}
+\subsection{简述拥塞控制}
+MPTCP的拥塞控制对TCP的拥塞控制的线性增加阶段进行了修改，而慢启动，快速重传、快速恢复都没有改变。每条子路径拥有自己的cwnd，MPTCP的拥塞算法主要关心cwnd的改变。
+\subsection{拥塞算法设计原则}
+\begin{itemize}
+  \item MPTCP的Throughput 要达到MPTCP中所有子路径中最好的一条路径
+  \item MPTCP应该和普通TCP一样从共享资源中获得相同资源
+  \item MPTCP中的流量将从拥塞的子路径转移到不拥塞的路径。
+\end{itemize}
+\subsection{算法理解}
+MPTCP的各个子路径运行着正常的TCP，因此直观的我们可以在每条子路径上运行自己的拥塞控制算法，但是这样就违背了设计原则2，这样的效果是MPTCP的吞吐量就会超过其他正常TCP。因此有如下EWTCP算法（n表示路径数量，$a=\frac{1}{\sqrt{n}}$）:
+\begin{description}
+  \item[对于路径r上的每一个ACK] 窗口增加的数值$W_r=\frac{a}{W_r}$
+  \item[对于路径r上的每一个LOSS] 窗口减少的数值$W_r=\frac{W_r}{2}$
+\end{description}
+a的取值参考~\cite{Honda2009Multipath}，这样，MPTCP就把每次cwnd的增加分摊到各个不同的子路径上，这样MPTCP就和正常TCP有着相同的吞吐量。但是这样的算法设计存在问题，不能有效的利用网络环境，我们应该根据设计原则3，将流量移动到拥塞情况最少的路径上去。因此有如下COUPLED算法（$W_t$是所有子流的窗口之和）：
+\begin{description}
+  \item[对于路径r上的每一个ACK] 窗口增加的数值$W_r=\frac{1}{W_t}$
+  \item[对于路径r上的每一个LOSS] 窗口减少的数值$W_r=\frac{W_t}{2}$
+\end{description}
+此算法让各个子路径的拥塞窗口的变化联系起来，比如有两条路径，一条路径上面拥塞导致导致丢包严重，那么不断的减少$W_t/2$，这样的话，就将流量从拥塞的路径移动到不拥塞的路径上。但是，这个算法存在两个问题：
+\begin{itemize}
+  \item 如果拥塞的子路径完全没有流量，我们就无从得知这条子路径上拥塞情况以后是不是会改善。
+  \item 没有考虑到RTT的的因素，比如对于一个智能手机来说，3G网络和WIFI相比丢包率更低，而RTT更大。
+\end{itemize}
+但是因为3G的拥塞情况更好，因此流量大部分会通过3G网络。而3G网络的吞吐量可能小于WIFI的吞吐量。因此提出MPTCP的拥塞控制算法（$W_r$的路径r的当前窗口值）：
+\begin{description}
+  \item[对于路径r上的每一个ACK] 窗口增加的数值$W_r=\min(\frac{a}{W_t},\frac{1}{W_r})$
+  \item[对于路径r上的每一个LOSS] 窗口减少的数值$W_r=\frac{W_r}{2}$
+\end{description}
+此算法通过 min操作来遵守设计原则2，通过a来保证各个子路径上都有适当的流量，从而达到设计原则1和3，详细的算法描述可以参考~\cite{Wischik2011Design}。
+\subsection{MPTCP的内核实现}
+MPTCP会在接收每一个ACK的时候，计算算法中的a。调用情况如下：
+\small\begin{verbatim}
+     tcp_ack()
+               =>tcp_ca_event()
+                    =>cwnd_event()
+                         =>mptcp_ccc_cwnd_event()
+\end{verbatim}\normalsize
+
+在tcp\_ack函数中也会增加cwnd，调用情况如下：
+\small\begin{verbatim}
+     tcp_ack()
+               =>tcp_cong_avoid()
+                    =>cong_avoid()
+                         => mptcp_ccc_cong_avoid()
+\end{verbatim}\normalsize

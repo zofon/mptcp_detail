@@ -1,0 +1,95 @@
+\section{socket详细介绍}
+我在学习MPTCP源码的时候，我们需要熟悉socket的结构。下面是socket相关的知识：
+
+用户使用socket系统调用编写应用程序时，通过一个数字来表示一个socket，所有的操作都在该数字上进行，这个数字称为套接字描述符。在系统调用的实现函数里，这个数字就会被映射成一个表示socket的结构体，该结构体保存了该socket的所有属性和数据。在内核的协议中实现中，关于表示socket的结构体，是一个比较复杂的东西，下面一一介绍。
+
+struct socket。
+这是一个基本的BSD socket，我们调用socket系统调用创建的各种不同类型的socket，开始创建的都是它，到后面，各种不同类型的socket在它的基础上进行各种扩展。struct socket是在虚拟文件系统上被创建出来的，可以把它看成一个文件，是可以被安全地扩展的。下面是其完整定义：
+\begin{verbatim}
+    struct socket 
+    {
+    socket_state            state;//这个结构体表示socket状态，是一个枚举变量
+    unsigned long           flags;
+    const struct proto_ops  *ops;
+    struct fasync_struct    *fasync_list;
+    struct file             *file;
+    struct sock             *sk;
+    wait_queue_head_t       wait;
+    short                   type;
+    };
+\end{verbatim}
+
+state用于表示socket所处的状态，是一个枚举变量，其类型定义如下：
+\begin{verbatim}
+typedef enum
+{
+	SS_FREE = 0,            //该socket还未分配
+	SS_UNCONNECTED,         //未连向任何socket
+	SS_CONNECTING,          //正在连接过程中
+	SS_CONNECTED,           //已连向一个socket
+	SS_DISCONNECTING        //正在断开连接的过程中
+}socket_state;
+\end{verbatim}
+该成员只对TCP socket有用，因为只有tcp是面向连接的协议，udp跟raw不需要维护socket状态。
+
+flags是一组标志位，在内核中并没有发现被使用。
+ops是协议相关的一组操作集，结构体struct proto_ops的定义如下：
+\begin{verbatim}
+struct proto_ops
+{
+    int     family;
+    struct module   *owner;
+    int (*release)(struct socket *sock);
+    int (*bind)(struct socket *sock, struct sockaddr *myaddr, int sockaddr_len);
+    int (*connect)(struct socket *sock, struct sockaddr *vaddr, int sockaddr_len, int flags);
+    int (*socketpair)(struct socket *sock1, struct socket *sock2);
+    int (*accept)(struct socket *sock,struct socket *newsock, int flags);
+    int (*getname)(struct socket *sock, struct sockaddr *addr,int *sockaddr_len, int peer);
+    unsigned int (*poll)(struct file *file, struct socket *sock,
+    struct poll_table_struct *wait);
+    int (*ioctl)(struct socket *sock, unsigned int cmd, unsigned long arg);
+    int (*listen)(struct socket *sock, int len);
+    int (*shutdown)(struct socket *sock, int flags);
+    int (*setsockopt)(struct socket *sock, int level,
+    int optname, char __user *optval, int optlen);
+    int (*getsockopt)(struct socket *sock, int level,
+    int optname, char __user *optval, int __user *optlen);
+    int (*sendmsg)(struct kiocb *iocb, struct socket *sock,
+    struct msghdr *m, size_t total_len);
+    int (*recvmsg)(struct kiocb *iocb, struct socket *sock,
+    struct msghdr *m, size_t total_len, int flags);
+    int (*mmap)(struct file *file, struct socket *sock,struct vm_area_struct * vma);
+    ssize_t (*sendpage)(struct socket *sock, struct page *page,
+    int offset, size_t size, int flags);
+};
+\end{verbatim}
+协议栈中总共定义了三个strcut proto\_ops类型的变量，分别是myinet\_stream\_ops, myinet\_dgram\_ops, myinet\_sockraw\_ops，对应流协议, 数据报和原始套接口协议的操作函数集。
+    type是socket的类型，对应的取值如下：
+    enum sock_type {
+        SOCK_DGRAM  = 1,
+        SOCK_STREAM = 2,
+        SOCK_RAW    = 3,
+        SOCK_RDM    = 4,
+        SOCK_SEQPACKET  = 5,
+        SOCK_DCCP   = 6,
+        SOCK_PACKET = 10,
+    };
+    sk是网络层对于socket的表示，结构体struct sock比较庞大，这里不详细列出，只介绍一些重要的成员，
+    sk_prot和sk_prot_creator，这两个成员指向特定的协议处理函数集，其类型是结构体struct proto，该结构体也是跟struct proto_ops相似的一组协议操作函数集。这两者之间的概念似乎有些混淆，可以这么理解，struct proto_ops的成员操作struct socket层次上的数据，处理完了，再由它们调用成员sk->sk_prot的函数，操作struct sock层次上的数据。即它们之间存在着层次上的差异。struct proto类型的变量在协议栈中总共也有三个，分别是mytcp_prot，myudp_prot，myraw_prot，对应TCP, UDP和RAW协议。
+    sk_state表示socket当前的连接状态，是一个比struct socket的state更为精细的状态，其可能的取值如下：    enum {
+        TCP_ESTABLISHED = 1,
+        TCP_SYN_SENT,
+        TCP_SYN_RECV,
+        TCP_FIN_WAIT1,
+        TCP_FIN_WAIT2,
+        TCP_TIME_WAIT,
+        TCP_CLOSE,
+        TCP_CLOSE_WAIT,
+        TCP_LAST_ACK,
+        TCP_LISTEN,
+        TCP_CLOSING，
+
+        TCP_MAX_STATES
+    };
+    这些取值从名字上看，似乎只使用于TCP协议，但事实上，UDP和RAW也借用了其中一些值，在一个socket创建之初，其取值都是TCP_CLOSE，一个UDP socket connect完成后，将这个值改为TCP_ESTABLISHED，最后，关闭sockt前置回TCP_CLOSE，RAW也一样。
+    sk_rcvbuf和sk_sndbuf分别表示接收和发送缓冲区的大小。sk_receive_queue和sk_write_queue分别为接收缓冲队列和发送缓冲队列，队列里排列的是套接字缓冲区struct sk_buff，队列中的struct sk_buff的字节数总和不能超过缓冲区大小的设定。

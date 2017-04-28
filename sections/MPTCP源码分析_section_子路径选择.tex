@@ -1,0 +1,125 @@
+\section{子路径选择}
+\subsection{简述子路径选择}
+支持MPTCP的链路中存在多条子路径，因此在发送数据的时候需要选择最优路径来进行操作。MPTCP利用内核通知链对MPTCP中各子路径进行增加路径、删除路径、修改路径优先级的操作。MPTCP根据相应的策略进行路径选择。
+\subsection{路径选择的代码实现}
+路径选择的关键在于从多个子路径中选择其中一个进行数据的发送。此过程通过下面的函数实现：
+\small\begin{verbatim}
+"net/mptcp/mptcp_sched.c" line 114 of 496
+114 static struct sock *get_available_subflow(struct sock *meta_sk,
+115                       struct sk_buff *skb,
+116                       bool zero_wnd_test)
+117 {
+118     struct mptcp_cb *mpcb = tcp_sk(meta_sk)->mpcb;   //MPTCP内核实现的三个组成部分之一：Multi-path control bock(mpcb)
+119     struct sock *sk, *bestsk = NULL, *lowpriosk = NULL, *backupsk = NULL;
+120     u32 min_time_to_peer = 0xffffffff, lowprio_min_time_to_peer = 0xffffffff;
+121     int cnt_backups = 0;
+122
+123     /* if there is only one subflow, bypass the scheduling function */
+124     if (mpcb->cnt_subflows == 1) {
+125         bestsk = (struct sock *)mpcb->connection_list;
+126         if (!mptcp_is_available(bestsk, skb, zero_wnd_test))
+127             bestsk = NULL;
+128         return bestsk;
+129     }
+130
+131     /* Answer data_fin on same subflow!!! */
+132     if (meta_sk->sk_shutdown & RCV_SHUTDOWN &&
+133         skb && mptcp_is_data_fin(skb)) {
+134         mptcp_for_each_sk(mpcb, sk) {
+135             if (tcp_sk(sk)->mptcp->path_index == mpcb->dfin_path_index &&
+136                 mptcp_is_available(sk, skb, zero_wnd_test))
+137                 return sk;
+138         }
+139     }
+\end{verbatim}\normalsize
+第124行的代码是处理只有一个子路径的特殊情况。第132行是对关闭操作进行了处理，在收包过程中对接收关闭包的子路径进行记录，然后回包的时候使用相同的子路径。
+\small\begin{verbatim}
+"net/mptcp/mptcp_input.c" line 876 of 2293
+875     /* Record it, because we want to send our data_fin on the same path */
+876     if (tp->mptcp->map_data_fin) {
+877         mpcb->dfin_path_index = tp->mptcp->path_index;
+878         mpcb->dfin_combined = !!(sk->sk_shutdown & RCV_SHUTDOWN);
+879     }
+\end{verbatim}\normalsize
+第876行是对子路径关闭的处理，关于data\_fin可以参考https://tools.ietf.org/html/rfc6824\#section-3.3.3。下面的代码遍历mpcb下管理的sk，选择最合适的sk。
+\small\begin{verbatim}
+"net/mptcp/mptcp_sched.c" line 142 of 496
+141     /* First, find the best subflow */
+142     mptcp_for_each_sk(mpcb, sk) {
+143         struct tcp_sock *tp = tcp_sk(sk);
+144
+145         if (tp->mptcp->rcv_low_prio || tp->mptcp->low_prio)
+146             cnt_backups++;
+147
+148         if ((tp->mptcp->rcv_low_prio || tp->mptcp->low_prio) &&
+149             tp->srtt < lowprio_min_time_to_peer) {
+150             if (!mptcp_is_available(sk, skb, zero_wnd_test))
+151                 continue;
+152
+153             if (mptcp_dont_reinject_skb(tp, skb)) {
+154                 backupsk = sk;
+155                 continue;
+156             }
+157
+158             lowprio_min_time_to_peer = tp->srtt;
+159             lowpriosk = sk;
+160         } else if (!(tp->mptcp->rcv_low_prio || tp->mptcp->low_prio) &&
+161                tp->srtt < min_time_to_peer) {
+162             if (!mptcp_is_available(sk, skb, zero_wnd_test))
+163                 continue;
+164
+165             if (mptcp_dont_reinject_skb(tp, skb)) {
+166                 backupsk = sk;
+167                 continue;
+168             }
+169
+170             min_time_to_peer = tp->srtt;
+171             bestsk = sk;
+172         }
+173     }
+\end{verbatim}\normalsize
+从上面的代码可以看出，选择sk的依据有5条：
+\begin{itemize}
+  \item “tp$\rightarrow$mptcp$\rightarrow$rcv\_low\_prio ” which stands for priority level in the remote machine.
+  \item "tp$\rightarrow$mptcp$\rightarrow$low\_prio" which stands for priority level in the local machine.
+  \item whether the skb has already been enqueued into this subsocket
+  \item "tp$\rightarrow$srtt" stands for smoothed round trip time.
+  \item mptcp\_is\_available() check the congestion of this subflow.
+\end{itemize}
+\small\begin{verbatim}
+"net/mptcp/mptcp_sched.c" line 175 of 496
+175     if (mpcb->cnt_established == cnt_backups && lowpriosk) {
+176         sk = lowpriosk;
+177     } else if (bestsk) {
+178         sk = bestsk;
+179     } else if (backupsk) {
+180         /* It has been sent on all subflows once - let's give it a
+181          * chance again by restarting its pathmask.
+182          */
+183         if (skb)
+184             TCP_SKB_CB(skb)->path_mask = 0;
+185         sk = backupsk;
+186     }
+187
+188     return sk;
+189 }
+\end{verbatim}\normalsize
+第176行的情况说明所有的子路径都处于backup状态。而第178行则是存在bestsk。
+
+\subsection{结论}
+\begin{itemize}
+  \item 控制路径选择的因素有下面四个：
+    \begin{enumerate}
+        \item 此路径在对端机器的优先级
+        \item 此路径在本地的优先级
+        \item 此次发送的skb是否已经使用此路径发送过，不能在同一路径重复发送。
+        \item tp$\rightarrow$srtt
+    \end{enumerate}
+  \item 调整 low\_prio 和 rcv\_low\_prio 可以通过下面命令：
+    \begin{enumerate}
+    \item ip link set dev eth0 multipath backup
+    \item 当通讯双方的一端被设置为backup后，可以通过MP\_PRIO
+    \item 通知对端。具体内容可以参考：https://tools.ietf.org/html/rfc6824\#section-3.3.8
+    \end{enumerate}
+  \item srtt的调整通过函数 tcp\_ack\_update\_rtt 实现。
+\end{itemize}
